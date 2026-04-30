@@ -103,13 +103,15 @@ class AudioProcessor:
         self.model = None
         self.feature_extractor = None
         
+        self._quantizer = None
+
         if not skip_model_loading:
             self.initialize_model()
-    
+
     def initialize_model(self):
         """
         Initialize the Wav2Vec2 model and feature extractor.
-        
+
         Downloads model files if not cached, loads the pre-trained model,
         and sets up the feature extractor for audio preprocessing.
         """
@@ -118,6 +120,14 @@ class AudioProcessor:
         self.model = Wav2Vec2ForPreTraining.from_pretrained(self.model_name, cache_dir=self.cache_dir, local_files_only=True)
         self.model.eval()
         self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(self.model_name, cache_dir=self.cache_dir)
+        self._init_quantizer()
+
+    def _init_quantizer(self):
+        """Cache a CustomQuantizer loaded with the model's trained weights."""
+        q = CustomQuantizer(self.model.config)
+        q.load_state_dict(self.model.quantizer.state_dict())
+        q.eval()
+        self._quantizer = q
 
     def load_model(self, model_name: str):
         """
@@ -222,6 +232,68 @@ class AudioProcessor:
         
         return codebook_indices_combined, file_info
     
+    def extract_features(self, audio: np.ndarray, sr: int) -> dict:
+        """
+        Extract all XLSR-53 feature representations from a pre-loaded audio array.
+
+        This is the per-file analogue of the per-category codebook analysis performed
+        by the main wav2scape pipeline.  Three representations are returned:
+
+        * ``hidden``    – mean-pooled transformer hidden states (1024-dim for XLSR-53)
+        * ``quantized`` – mean-pooled quantized codevectors    (768-dim)
+        * ``codebook``  – normalised codebook usage histogram  (102400-dim, sums to 1.0)
+                          This is identical in construction to the per-file contribution
+                          to the per-category ``normalized_codebook_usage_vector`` that
+                          wav2scape uses for its similarity matrix and PCA scatter plots.
+
+        Args:
+            audio: 1-D float32 waveform array.
+            sr:    Sample rate of ``audio``.
+
+        Returns:
+            dict with numpy arrays keyed ``'hidden'``, ``'quantized'``, ``'codebook'``.
+        """
+        if self.model is None or self.feature_extractor is None:
+            raise RuntimeError("Model not initialized. Call initialize_model() first.")
+
+        if sr != self.sample_rate:
+            audio = torchaudio.functional.resample(
+                torch.from_numpy(audio).float(),
+                orig_freq=sr,
+                new_freq=self.sample_rate,
+            ).numpy()
+
+        input_values = self.feature_extractor(
+            audio,
+            sampling_rate=self.sample_rate,
+            return_tensors="pt",
+            padding=True,
+        ).input_values
+
+        with torch.no_grad():
+            wav2vec_out = self.model.wav2vec2(input_values, return_dict=False)
+
+            # Hidden states: (1, T, 1024) → mean-pool → (1024,)
+            hidden = wav2vec_out[0].mean(dim=1).squeeze(0).cpu().numpy()
+
+            # Quantized codevectors + codebook indices
+            cnn_feats = self.model.dropout_features(wav2vec_out[1])
+            quant_out, _, cb_indices = self._quantizer(cnn_feats)
+
+            # Quantized: (1, T, 768) → mean-pool → (768,)
+            quantized = quant_out.mean(dim=1).squeeze(0).cpu().numpy()
+
+            # Codebook: combined index = group0 × 320 + group1 ∈ [0, 102399]
+            combined = (
+                cb_indices[0, :, 0] * self.model.config.num_codevectors_per_group
+                + cb_indices[0, :, 1]
+            ).cpu().numpy().astype(np.int64)
+            n_cb = self.model.config.num_codevectors_per_group ** 2  # 102400
+            hist = np.bincount(combined, minlength=n_cb).astype(np.float32)
+            hist /= hist.sum()
+
+        return {"hidden": hidden, "quantized": quantized, "codebook": hist}
+
     def _extract_categoryB_id(self, file_path: str) -> str:
         """
         Extract Category B identifier from audio filename.
